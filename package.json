@@ -1,0 +1,12 @@
+{
+  "name": "screenshot-service",
+  "version": "1.0.0",
+  "description": "GoFullPage-style screenshot HTTP API",
+  "main": "gofullpage_server.js",
+  "scripts": {
+    "start": "node gofullpage_server.js"
+  },
+  "dependencies": {
+    "puppeteer": "^22.0.0"
+  }
+}
