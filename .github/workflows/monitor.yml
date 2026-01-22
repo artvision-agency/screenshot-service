@@ -1,0 +1,185 @@
+name: Screenshot Monitor
+
+on:
+  schedule:
+    # Каждый день в 9:00 и 18:00 по Москве (6:00 и 15:00 UTC)
+    - cron: '0 6 * * *'
+    - cron: '0 15 * * *'
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'URLs to monitor (comma-separated)'
+        required: false
+        default: ''
+      notify:
+        description: 'Send Telegram notification'
+        type: boolean
+        default: true
+
+env:
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install playwright aiohttp
+          playwright install chromium
+          playwright install-deps
+      
+      - name: Create monitor script
+        run: |
+          cat > monitor.py << 'EOF'
+          import asyncio
+          import json
+          import os
+          import sys
+          from datetime import datetime
+          from pathlib import Path
+          
+          # Добавляем путь к screenshot_service
+          sys.path.insert(0, '.')
+          from screenshot_service import ScreenshotService
+          
+          # URLs для мониторинга (можно вынести в отдельный файл)
+          DEFAULT_URLS = [
+              # Добавьте свои URL
+              # "https://client-site.ru",
+              # "https://another-site.ru",
+          ]
+          
+          async def monitor():
+              # URLs из input или default
+              urls_input = os.getenv("INPUT_URLS", "")
+              if urls_input:
+                  urls = [u.strip() for u in urls_input.split(",") if u.strip()]
+              else:
+                  urls = DEFAULT_URLS
+              
+              if not urls:
+                  print("No URLs to monitor")
+                  return {"changes": [], "errors": []}
+              
+              results = {
+                  "timestamp": datetime.now().isoformat(),
+                  "urls": [],
+                  "changes": [],
+                  "errors": []
+              }
+              
+              async with ScreenshotService(output_dir="./monitoring") as service:
+                  for url in urls:
+                      print(f"Monitoring: {url}")
+                      result = await service.monitor_snapshot(url)
+                      
+                      results["urls"].append({
+                          "url": url,
+                          "success": result.get("success", False),
+                          "file": result.get("output"),
+                          "comparison": result.get("comparison")
+                      })
+                      
+                      if result.get("success"):
+                          comp = result.get("comparison", {})
+                          if comp.get("changed"):
+                              results["changes"].append({
+                                  "url": url,
+                                  "diff_percent": comp.get("size_difference_percent")
+                              })
+                              print(f"  ⚠️ Changed: {comp.get('size_difference_percent')}%")
+                          else:
+                              print(f"  ✓ No changes")
+                      else:
+                          results["errors"].append({
+                              "url": url,
+                              "error": result.get("error")
+                          })
+                          print(f"  ✗ Error: {result.get('error')}")
+              
+              # Сохраняем результат
+              with open("monitor_result.json", "w") as f:
+                  json.dump(results, f, indent=2)
+              
+              return results
+          
+          if __name__ == "__main__":
+              result = asyncio.run(monitor())
+              
+              # Выводим для GitHub Actions
+              print(f"\n{'='*50}")
+              print(f"Monitored: {len(result['urls'])} URLs")
+              print(f"Changes detected: {len(result['changes'])}")
+              print(f"Errors: {len(result['errors'])}")
+              
+              # Exit code для Actions
+              if result['errors']:
+                  sys.exit(1)
+          EOF
+      
+      - name: Run monitor
+        id: monitor
+        run: |
+          python monitor.py
+          
+          # Читаем результат
+          if [ -f monitor_result.json ]; then
+            CHANGES=$(cat monitor_result.json | jq '.changes | length')
+            echo "changes=$CHANGES" >> $GITHUB_OUTPUT
+          fi
+        env:
+          INPUT_URLS: ${{ github.event.inputs.urls }}
+      
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitoring-screenshots-${{ github.run_number }}
+          path: monitoring/
+          retention-days: 30
+      
+      - name: Send Telegram notification
+        if: ${{ (steps.monitor.outputs.changes > 0 || failure()) && (github.event.inputs.notify != 'false') }}
+        run: |
+          if [ -f monitor_result.json ]; then
+            RESULT=$(cat monitor_result.json)
+            CHANGES=$(echo $RESULT | jq -r '.changes[] | "• \(.url): \(.diff_percent)%"')
+            ERRORS=$(echo $RESULT | jq -r '.errors[] | "• \(.url): \(.error)"')
+            
+            MESSAGE="🔍 *Screenshot Monitor*%0A%0A"
+            
+            if [ -n "$CHANGES" ]; then
+              MESSAGE="${MESSAGE}⚠️ *Изменения:*%0A${CHANGES}%0A%0A"
+            fi
+            
+            if [ -n "$ERRORS" ]; then
+              MESSAGE="${MESSAGE}❌ *Ошибки:*%0A${ERRORS}"
+            fi
+            
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              -d "text=${MESSAGE}" \
+              -d "parse_mode=Markdown"
+          fi
+      
+      - name: Commit changes (optional)
+        if: always()
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          if [ -d monitoring ]; then
+            git add monitoring/ || true
+            git diff --staged --quiet || git commit -m "📸 Monitor snapshot $(date +%Y-%m-%d)"
+            git push || true
+          fi
